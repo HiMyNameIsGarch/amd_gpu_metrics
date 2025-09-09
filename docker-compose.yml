@@ -1,0 +1,12 @@
+services:
+  gpu-metrics-server:
+    build: .
+    container_name: gpu-metrics-server
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    privileged: true
+    volumes:
+      - /opt/rocm/bin/rocm-smi:/usr/local/bin/rocm-smi:ro
