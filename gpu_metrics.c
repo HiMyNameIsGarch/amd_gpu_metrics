@@ -1,4 +1,5 @@
 #include <glob.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,12 @@ typedef struct {
     long vram_total;
     long temperature;
     long power_usage;
+
+    int16_t sclk_clock;
+    int16_t mclk_clock;
+    int16_t voltage;
+    int16_t fan_level;
+    int16_t fan_rpm;
     int found;
 } GPUInfo;
 
@@ -38,7 +45,7 @@ int read_sysfs_file(const char *path, char *output) {
     return 0;
 }
 
-void parse_gpu_info(GPUInfo *metrics, char* card_name) {
+void parse_gpu_info(GPUInfo *metrics, char* card_name, double* scrape_time) {
     char path[MAX_PATH];
     char buffer[BUFFER_SIZE_];
 
@@ -47,6 +54,7 @@ void parse_gpu_info(GPUInfo *metrics, char* card_name) {
     snprintf(metrics->name, sizeof(metrics->name), "%s", card_name);
     metrics->found = 0;
 
+    time_t before = time(NULL);
     // GPU Utilization
     snprintf(path, MAX_PATH, "/sys/class/drm/%s/gpu_busy_percent", card_name);
     if (read_sysfs_file(path, buffer)) {
@@ -78,6 +86,52 @@ void parse_gpu_info(GPUInfo *metrics, char* card_name) {
         }
         globfree(&glob_result);
     }
+
+    time_t after = time(NULL);
+
+    *scrape_time = difftime(before, after);
+
+}
+
+typedef struct {
+    char metrics[2048];
+    int gpu_id;
+} metrics_builder_t;
+
+void metrics_builder_init(metrics_builder_t* builder, int gpu_id) {
+    builder->metrics[0] = '\0';
+    builder->gpu_id = gpu_id;
+}
+
+void metrics_builder_add_metric(metrics_builder_t* builder,
+                               const char* help,
+                               const char* name,
+                               const char* format,
+                               long value) {
+    char temp[256];
+
+    // Create the format string dynamically
+    char full_format[128];
+    snprintf(full_format, sizeof(full_format),
+        "# HELP amd_gpu_%%s %s\n"
+        "# TYPE amd_gpu_%%s gauge\n"
+        "amd_gpu_%%s{gpu=\"%%d\"} %s\n\n",
+        help, format);
+
+    snprintf(temp, sizeof(temp), full_format,
+             name, name, name, builder->gpu_id, value);
+
+    strncat(builder->metrics, temp, sizeof(builder->metrics) - strlen(builder->metrics) - 1);
+}
+
+void metrics_builder_finalize(metrics_builder_t* builder) {
+    char temp[256];
+    snprintf(temp, sizeof(temp),
+        "# HELP amd_gpu_scrape_duration_seconds Time taken to scrape GPU metrics\n"
+        "# TYPE amd_gpu_scrape_duration_seconds gauge\n"
+        "amd_gpu_scrape_duration_seconds 0.001\n");
+
+    strncat(builder->metrics, temp, sizeof(builder->metrics) - strlen(builder->metrics) - 1);
 }
 
 char* build_metrics_response() {
@@ -85,42 +139,40 @@ char* build_metrics_response() {
     char metrics[BUFFER_SIZE - 512] = {0};
     GPUInfo gpu_metrics;
 
-    time_t now = time(NULL);
+    double scrape_time = 0;
 
-    parse_gpu_info(&gpu_metrics, "card1");
+    parse_gpu_info(&gpu_metrics, "card1", &scrape_time);
 
-    // build comprehensive metrics string
-    snprintf(metrics, sizeof(metrics),
-        "# HELP amd_gpu_usage_percent GPU usage percentage\n"
-        "# TYPE amd_gpu_usage_percent gauge\n"
-        "amd_gpu_usage_percent{gpu=\"0\"} %.1ld\n\n"
+    printf("Scrape time was: %f", scrape_time);
 
-        "# HELP amd_gpu_temperature_celsius GPU temperature in Celsius\n"
-        "# TYPE amd_gpu_temperature_celsius gauge\n"
-        "amd_gpu_temperature_celsius{gpu=\"0\"} %.1ld\n\n"
+    metrics_builder_t builder;
+    metrics_builder_init(&builder, 0);
 
-        "# HELP amd_gpu_power_watts GPU power consumption in Watts\n"
-        "# TYPE amd_gpu_power_watts gauge\n"
-        "amd_gpu_power_watts{gpu=\"0\"} %.3ld\n\n"
+    metrics_builder_add_metric(&builder,
+                               "usage percentage", "usage_percent", "%.1ld",
+                               gpu_metrics.utilization);
 
-        "# HELP amd_gpu_memory_usage_percent GPU memory usage percentage\n"
-        "# TYPE amd_gpu_memory_usage_percent gauge\n"
-        "amd_gpu_memory_usage_percent{gpu=\"0\"} %.1ld\n\n"
+    metrics_builder_add_metric(&builder,
+                               "temperature in Celsius", "temperature_celsius", "%.1ld",
+                               gpu_metrics.temperature);
 
-        "# HELP amd_gpu_memory_activity_percent GPU memory activity percentage\n"
-        "# TYPE amd_gpu_memory_activity_percent gauge\n"
-        "amd_gpu_memory_activity_percent{gpu=\"0\"} %.1ld\n\n"
+    metrics_builder_add_metric(&builder,
+                               "power consumption in Watts", "power_watts", "%.3ld",
+                               gpu_metrics.power_usage);
 
-        "# HELP amd_gpu_scrape_duration_seconds Time taken to scrape GPU metrics\n"
-        "# TYPE amd_gpu_scrape_duration_seconds gauge\n"
-        "amd_gpu_scrape_duration_seconds 0.001\n",
+    metrics_builder_add_metric(&builder,
+                               "memory usage percentage", "memory_usage_percent", "%.1ld",
+                               gpu_metrics.vram_total);
 
-        gpu_metrics.utilization,
-        gpu_metrics.temperature,
-        gpu_metrics.power_usage,
-        gpu_metrics.vram_used,
-        gpu_metrics.vram_total
-    );
+    metrics_builder_add_metric(&builder,
+                               "memory usage percentage", "memory_usage_percent", "%.1ld",
+                               gpu_metrics.power_usage);
+
+    metrics_builder_add_metric(&builder,
+                               "memory activity percentage", "memory_activity_percentage", "%.1ld",
+                               gpu_metrics.power_usage);
+
+    metrics_builder_finalize(&builder);
 
     snprintf(response, sizeof(response),
         "HTTP/1.1 200 OK\r\n"
@@ -129,7 +181,7 @@ char* build_metrics_response() {
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s",
-        strlen(metrics), metrics);
+        strlen(builder.metrics), builder.metrics);
 
     return response;
 }
