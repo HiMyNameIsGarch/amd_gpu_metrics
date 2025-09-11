@@ -1,3 +1,4 @@
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,140 +9,117 @@
 
 #define PORT 7654
 #define BUFFER_SIZE 16384
+#define MAX_PATH 512
+#define BUFFER_SIZE_ 128
 
 typedef struct {
-    float usage;
-    float temperature;
-    float power;
-    float memory_usage;
-    float memory_activity;
-    int fan_level;
-    int fan_rpm;
-    int voltage;
-    int sclk_clock;
-    int mclk_clock;
-    char product_name[128];
-    char gpu_arch[32];
-} GPU_Metrics;
+    char name[64];
+    long utilization;
+    long vram_used;
+    long vram_total;
+    long temperature;
+    long power_usage;
+    int found;
+} GPUInfo;
 
-void parse_rocm_smi_output(GPU_Metrics *metrics) {
-    // test the command before working with it, otherwise the metrics will show only 0 values
-    FILE *fp = popen("/usr/bin/rocm-smi --showuse --showmemuse --showpower --showtemp --showfan --showvoltage --showclocks 2>/dev/null", "r");
-    if (fp == NULL) {
-        return;
+int read_sysfs_file(const char *path, char *output) {
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        return 0;
     }
 
-    char buffer[512];
-    memset(metrics, 0, sizeof(GPU_Metrics));
-
-    // harcoded matrics, maybe delete them later
-    strcpy(metrics->gpu_arch, "gfx803");
-    strcpy(metrics->product_name, "Radeon RX 570 Series");
-
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if (strstr(buffer, "GPU use (%)")) {
-            sscanf(buffer, "GPU[%*d] : GPU use (%*s) : %f", &metrics->usage);
-        }
-        else if (strstr(buffer, "Temperature (Sensor edge)")) {
-            sscanf(buffer, "GPU[%*d] : Temperature (Sensor edge) (C) : %f", &metrics->temperature);
-        }
-        else if (strstr(buffer, "Current Socket Graphics Package Power")) {
-            sscanf(buffer, "GPU[%*d] : Current Socket Graphics Package Power (W) : %f", &metrics->power);
-        }
-        else if (strstr(buffer, "GPU Memory Allocated (VRAM%)")) {
-            sscanf(buffer, "GPU[%*d] : GPU Memory Allocated (VRAM%%) : %f", &metrics->memory_usage);
-        }
-        else if (strstr(buffer, "GPU Memory Read/Write Activity (%)")) {
-            sscanf(buffer, "GPU[%*d] : GPU Memory Read/Write Activity (%*s) : %f", &metrics->memory_activity);
-        }
-        else if (strstr(buffer, "Fan RPM")) {
-            sscanf(buffer, "GPU[%*d] : Fan RPM: %d", &metrics->fan_rpm);
-        }
-        else if (strstr(buffer, "Fan Level")) {
-            sscanf(buffer, "GPU[%*d] : Fan Level: %*d (%d)", &metrics->fan_level);
-        }
-        else if (strstr(buffer, "Voltage")) {
-            sscanf(buffer, "GPU[%*d] : Voltage (mV): %d", &metrics->voltage);
-        }
-        else if (strstr(buffer, "clock level")) {
-            sscanf(buffer, "GPU[%*d] : mclk clock level: %*d: (%dMhz)", &metrics->mclk_clock);
-            sscanf(buffer, "GPU[%*d] : sclk clock level: %*d: (%dMhz)", &metrics->sclk_clock);
-        }
+    if (fgets(output, BUFFER_SIZE, file)) {
+        // Remove newline if present
+        output[strcspn(output, "\n")] = 0;
+        fclose(file);
+        return 1;
     }
-    pclose(fp);
+    fclose(file);
+    return 0;
+}
+
+void parse_gpu_info(GPUInfo *metrics, char* card_name) {
+    char path[MAX_PATH];
+    char buffer[BUFFER_SIZE_];
+
+    memset(metrics, 0, sizeof(GPUInfo));
+
+    snprintf(metrics->name, sizeof(metrics->name), "%s", card_name);
+    metrics->found = 0;
+
+    // GPU Utilization
+    snprintf(path, MAX_PATH, "/sys/class/drm/%s/gpu_busy_percent", card_name);
+    if (read_sysfs_file(path, buffer)) {
+        metrics->utilization = atol(buffer);
+        metrics->found = 1;
+    }
+
+    // VRAM Used
+    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/mem_info_vram_used", card_name);
+    if (read_sysfs_file(path, buffer)) {
+        metrics->vram_used = atol(buffer);
+        metrics->found = 1;
+    }
+
+    // VRAM Total
+    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/mem_info_vram_total", card_name);
+    if (read_sysfs_file(path, buffer)) {
+        metrics->vram_total = atol(buffer);
+        metrics->found = 1;
+    }
+
+    // Temperature - try multiple possible locations
+    glob_t glob_result;
+    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/temp1_input", card_name);
+    if (glob(path, GLOB_NOSORT, NULL, &glob_result) == 0) {
+        if (glob_result.gl_pathc > 0 && read_sysfs_file(glob_result.gl_pathv[0], buffer)) {
+            metrics->temperature = atol(buffer) / 1000; // Convert millidegree to degree
+            metrics->found = 1;
+        }
+        globfree(&glob_result);
+    }
 }
 
 char* build_metrics_response() {
     static char response[BUFFER_SIZE];
     char metrics[BUFFER_SIZE - 512] = {0};
-    GPU_Metrics gpu_metrics;
+    GPUInfo gpu_metrics;
 
     time_t now = time(NULL);
 
-    parse_rocm_smi_output(&gpu_metrics);
+    parse_gpu_info(&gpu_metrics, "card1");
 
     // build comprehensive metrics string
     snprintf(metrics, sizeof(metrics),
-        "# HELP amd_gpu_info GPU information\n"
-        "# TYPE amd_gpu_info gauge\n"
-        "amd_gpu_info{gpu=\"0\",product_name=\"%s\",architecture=\"%s\"} 1\n\n"
-
         "# HELP amd_gpu_usage_percent GPU usage percentage\n"
         "# TYPE amd_gpu_usage_percent gauge\n"
-        "amd_gpu_usage_percent{gpu=\"0\"} %.1f\n\n"
+        "amd_gpu_usage_percent{gpu=\"0\"} %.1ld\n\n"
 
         "# HELP amd_gpu_temperature_celsius GPU temperature in Celsius\n"
         "# TYPE amd_gpu_temperature_celsius gauge\n"
-        "amd_gpu_temperature_celsius{gpu=\"0\"} %.1f\n\n"
+        "amd_gpu_temperature_celsius{gpu=\"0\"} %.1ld\n\n"
 
         "# HELP amd_gpu_power_watts GPU power consumption in Watts\n"
         "# TYPE amd_gpu_power_watts gauge\n"
-        "amd_gpu_power_watts{gpu=\"0\"} %.3f\n\n"
+        "amd_gpu_power_watts{gpu=\"0\"} %.3ld\n\n"
 
         "# HELP amd_gpu_memory_usage_percent GPU memory usage percentage\n"
         "# TYPE amd_gpu_memory_usage_percent gauge\n"
-        "amd_gpu_memory_usage_percent{gpu=\"0\"} %.1f\n\n"
+        "amd_gpu_memory_usage_percent{gpu=\"0\"} %.1ld\n\n"
 
         "# HELP amd_gpu_memory_activity_percent GPU memory activity percentage\n"
         "# TYPE amd_gpu_memory_activity_percent gauge\n"
-        "amd_gpu_memory_activity_percent{gpu=\"0\"} %.1f\n\n"
-
-        "# HELP amd_gpu_fan_speed_percent GPU fan speed percentage\n"
-        "# TYPE amd_gpu_fan_speed_percent gauge\n"
-        "amd_gpu_fan_speed_percent{gpu=\"0\"} %d\n\n"
-
-        "# HELP amd_gpu_current_voltage GPU current voltage\n"
-        "# TYPE amd_gpu_current_voltage gauge\n"
-        "amd_gpu_current_voltage{gpu=\"0\"} %d\n\n"
-
-        "# HELP amd_gpu_current_sclk_clock GPU current sclk_clock\n"
-        "# TYPE amd_gpu_current_sclk_clock gauge\n"
-        "amd_gpu_current_sclk_clock{gpu=\"0\"} %d\n\n"
-
-        "# HELP amd_gpu_current_mclk_clock GPU current mclk_clock\n"
-        "# TYPE amd_gpu_current_mclk_clock gauge\n"
-        "amd_gpu_current_mclk_clock{gpu=\"0\"} %d\n\n"
-
-        "# HELP amd_gpu_scrape_timestamp Last metrics scrape timestamp\n"
-        "# TYPE amd_gpu_scrape_timestamp gauge\n"
-        "amd_gpu_scrape_timestamp{gpu=\"0\"} %ld\n\n"
+        "amd_gpu_memory_activity_percent{gpu=\"0\"} %.1ld\n\n"
 
         "# HELP amd_gpu_scrape_duration_seconds Time taken to scrape GPU metrics\n"
         "# TYPE amd_gpu_scrape_duration_seconds gauge\n"
         "amd_gpu_scrape_duration_seconds 0.001\n",
 
-        gpu_metrics.product_name,
-        gpu_metrics.gpu_arch,
-        gpu_metrics.usage,
+        gpu_metrics.utilization,
         gpu_metrics.temperature,
-        gpu_metrics.power,
-        gpu_metrics.memory_usage,
-        gpu_metrics.memory_activity,
-        gpu_metrics.fan_rpm,
-        gpu_metrics.voltage,
-        gpu_metrics.sclk_clock,
-        gpu_metrics.mclk_clock,
-        now
+        gpu_metrics.power_usage,
+        gpu_metrics.vram_used,
+        gpu_metrics.vram_total
     );
 
     snprintf(response, sizeof(response),
