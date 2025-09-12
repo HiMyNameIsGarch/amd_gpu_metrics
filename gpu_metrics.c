@@ -1,3 +1,5 @@
+#include <asm-generic/errno-base.h>
+#include <errno.h>
 #include <glob.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +10,7 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <signal.h>
 
 #define PORT 7654
 #define BUFFER_SIZE 16384
@@ -303,7 +306,19 @@ void handle_client(int client_socket) {
     close(client_socket);
 }
 
+volatile sig_atomic_t keep_running = 1;
+
+void signal_handler(int sig) {
+    keep_running = 0;
+}
+
 int main() {
+    // handle docker signals
+    signal(SIGINT, signal_handler);   // Ctrl+C?
+    signal(SIGTERM, signal_handler);  // docker stop
+    signal(SIGQUIT, signal_handler);  // docker kill
+
+    // socket setup
     int server_fd, client_socket;
     struct sockaddr_in address;
     int opt = 1;
@@ -336,20 +351,42 @@ int main() {
     // discover GPU paths at server startup
     if (!discover_gpu_paths("card1")) {
         fprintf(stderr, "ERROR: Failed to discover GPU paths. Check if GPU is available.\n");
-        exit(1);
+        // don't exit for now, let docker handle stuff
     }
 
     printf("AMD GPU Exporter running on port %d\n", PORT);
     printf("Metrics available at: http://localhost:%d/metrics\n", PORT);
 
-    while (1) {
-        if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept");
-            continue;
+    while (keep_running) {
+        fd_set readfds;
+        struct timeval tv;
+
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+
+        // set timeout to allow signal checking
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int activity = select(server_fd + 1, &readfds, NULL, NULL, &tv);
+
+        if (activity < 0 && errno != EINTR) {
+            perror("select error");
+            break;
         }
 
-        handle_client(client_socket);
+        if (activity > 0 && FD_ISSET(server_fd, &readfds)) {
+            if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+                if (errno != EINTR) {
+                    perror("accept");
+                }
+                continue;
+            }
+            handle_client(client_socket);
+        }
     }
-
+    // cleanup
+    printf("Shutting down gracefully...\n");
+    close(server_fd);
     return 0;
 }
