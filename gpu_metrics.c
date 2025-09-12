@@ -14,9 +14,15 @@
 #define MAX_PATH 512
 #define BUFFER_SIZE_ 128
 
+#define DIV_TO_MB (1024 * 1024)
+#define NO_DIV 1
+#define DIV_TO_WATT 1000000.0
+#define DIV_TO_MHZ 1000000
+#define DIV_TO_CESIUS 1000.0
+
 typedef struct {
     char name[64];
-    int16_t utilization;
+    long utilization;
     double temperature;
     double power_usage;
     long vram_used;
@@ -25,7 +31,6 @@ typedef struct {
     long mclk_clock;
     long voltage;
     long fan_rpm;
-
     double scrape_time;
     int found;
 } GPUInfo;
@@ -37,7 +42,7 @@ int read_sysfs_file(const char *path, char *output) {
     }
 
     if (fgets(output, BUFFER_SIZE, file)) {
-        // Remove newline if present
+        // remove newline if present
         output[strcspn(output, "\n")] = 0;
         fclose(file);
         return 1;
@@ -46,10 +51,95 @@ int read_sysfs_file(const char *path, char *output) {
     return 0;
 }
 
-void parse_gpu_info(GPUInfo *metrics, char* card_name) {
+int read_sysfs_metric_div_long(const char* card_name,
+                          const char* file_path,
+                          double divisor,
+                          long* result)
+{
     char path[MAX_PATH];
-    char buffer[BUFFER_SIZE_];
+    char buffer[64];
+    int found = 0;
 
+    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/%s",
+             card_name, file_path);
+    if (read_sysfs_file(path, buffer)) {
+        *result = atol(buffer) / divisor;
+        found = 1;
+    }
+
+    return found;
+
+}
+
+int read_sysfs_metric_div_double(const char* card_name,
+                          const char* file_path,
+                          double divisor,
+                          double* result)
+{
+    char path[MAX_PATH];
+    char buffer[64];
+    int found = 0;
+
+    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/%s",
+             card_name, file_path);
+    if (read_sysfs_file(path, buffer)) {
+        *result = atol(buffer) / divisor;
+        found = 1;
+    }
+
+    return found;
+
+}
+
+int read_sysfs_metric_div_glob_double(const char* card_name,
+                          const char* file_pattern,
+                          double divisor,
+                          double* result)
+{
+    char path[MAX_PATH];
+    char buffer[64];
+    glob_t glob_result;
+    int found = 0;
+
+    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/hwmon/hwmon*/%s",
+             card_name, file_pattern);
+
+    if (glob(path, GLOB_NOSORT, NULL, &glob_result) == 0) {
+        if (glob_result.gl_pathc > 0 && read_sysfs_file(glob_result.gl_pathv[0], buffer)) {
+            *result = atol(buffer) / divisor;
+            found = 1;
+        }
+        globfree(&glob_result);
+    }
+
+    return found;
+}
+
+int read_sysfs_metric_div_glob_long(const char* card_name,
+                          const char* file_pattern,
+                          long divisor,
+                          long* result)
+{
+    char path[MAX_PATH];
+    char buffer[64];
+    glob_t glob_result;
+    int found = 0;
+
+    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/hwmon/hwmon*/%s",
+             card_name, file_pattern);
+
+    if (glob(path, GLOB_NOSORT, NULL, &glob_result) == 0) {
+        if (glob_result.gl_pathc > 0 && read_sysfs_file(glob_result.gl_pathv[0], buffer)) {
+            *result = atol(buffer) / divisor;
+            found = 1;
+        }
+        globfree(&glob_result);
+    }
+
+    return found;
+}
+
+void parse_gpu_info(GPUInfo *metrics, char* card_name) {
     memset(metrics, 0, sizeof(GPUInfo));
 
     snprintf(metrics->name, sizeof(metrics->name), "%s", card_name);
@@ -58,94 +148,24 @@ void parse_gpu_info(GPUInfo *metrics, char* card_name) {
     // start recording the scrape time
     struct timeval start, end;
     gettimeofday(&start, NULL);
-
     // GPU Utilization
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/gpu_busy_percent", card_name);
-    if (read_sysfs_file(path, buffer)) {
-        metrics->utilization = atol(buffer);
-        metrics->found = 1;
-    }
-
-    // Power Usage
-    glob_t glob_result1;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/power1_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result1) == 0) {
-        if (glob_result1.gl_pathc > 0 && read_sysfs_file(glob_result1.gl_pathv[0], buffer)) {
-            metrics->power_usage = atol(buffer) / 1000000.0; // Convert microjule to Watts
-            metrics->found = 1;
-        }
-        globfree(&glob_result1);
-    }
-
+    metrics->found = read_sysfs_metric_div_long(card_name, "gpu_busy_percent", NO_DIV, &metrics->utilization);
+    // Power usage in Watts
+    metrics->found = read_sysfs_metric_div_glob_double(card_name, "power1_input", DIV_TO_WATT, &metrics->power_usage);
     // VRAM Used
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/mem_info_vram_used", card_name);
-    if (read_sysfs_file(path, buffer)) {
-        metrics->vram_used = atol(buffer) / (1024.0 * 1024.0); // display in MB
-        metrics->found = 1;
-    }
-
+    metrics->found = read_sysfs_metric_div_long(card_name, "mem_info_vram_used", DIV_TO_MB , &metrics->vram_used);
     // VRAM Total
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/mem_info_vram_total", card_name);
-    if (read_sysfs_file(path, buffer)) {
-        metrics->vram_total = atol(buffer)/ (1024.0 * 1024.0); // display in MB
-        metrics->found = 1;
-    }
-
+    metrics->found = read_sysfs_metric_div_long(card_name, "mem_info_vram_total", DIV_TO_MB , &metrics->vram_total);
     // Temperature
-    glob_t glob_result;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/temp1_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result) == 0) {
-        if (glob_result.gl_pathc > 0 && read_sysfs_file(glob_result.gl_pathv[0], buffer)) {
-            metrics->temperature = atol(buffer) / 1000.0; // Convert millidegree to degree
-            metrics->found = 1;
-        }
-        globfree(&glob_result);
-    }
-
+    metrics->found = read_sysfs_metric_div_glob_double(card_name, "temp1_input", DIV_TO_CESIUS , &metrics->temperature);
     // Sclk clock
-    glob_t glob_result_sclk;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/freq1_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result_sclk) == 0) {
-        if (glob_result_sclk.gl_pathc > 0 && read_sysfs_file(glob_result_sclk.gl_pathv[0], buffer)) {
-            metrics->sclk_clock = atol(buffer) / 1000000; // Convert millidegree to degree
-            metrics->found = 1;
-        }
-        globfree(&glob_result_sclk);
-    }
-
+    metrics->found = read_sysfs_metric_div_glob_long(card_name, "freq1_input", DIV_TO_MHZ , &metrics->sclk_clock);
     // Mclk clock
-    glob_t glob_result_mclk;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/freq2_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result_mclk) == 0) {
-        if (glob_result_mclk.gl_pathc > 0 && read_sysfs_file(glob_result_mclk.gl_pathv[0], buffer)) {
-            metrics->mclk_clock = atol(buffer) / 1000000; // Convert millidegree to degree
-            metrics->found = 1;
-        }
-        globfree(&glob_result_mclk);
-    }
-
+    metrics->found = read_sysfs_metric_div_glob_long(card_name, "freq2_input", DIV_TO_MHZ , &metrics->mclk_clock);
     // Voltage
-    glob_t glob_result_voltage;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/in0_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result_voltage) == 0) {
-        if (glob_result_voltage.gl_pathc > 0 && read_sysfs_file(glob_result_voltage.gl_pathv[0], buffer)) {
-            metrics->voltage = atol(buffer);
-            metrics->found = 1;
-        }
-        globfree(&glob_result_voltage);
-    }
-
+    metrics->found = read_sysfs_metric_div_glob_long(card_name, "in0_input", NO_DIV , &metrics->voltage);
     // Fan RPM
-    glob_t glob_result_fan_rpm;
-    snprintf(path, MAX_PATH, "/sys/class/drm/%s/device/hwmon/hwmon*/fan1_input", card_name);
-    if (glob(path, GLOB_NOSORT, NULL, &glob_result_fan_rpm) == 0) {
-        if (glob_result_fan_rpm.gl_pathc > 0 && read_sysfs_file(glob_result_fan_rpm.gl_pathv[0], buffer)) {
-            metrics->fan_rpm = atol(buffer);
-            metrics->found = 1;
-        }
-        globfree(&glob_result_fan_rpm);
-    }
-
+    metrics->found = read_sysfs_metric_div_glob_long(card_name, "fan1_input", NO_DIV , &metrics->fan_rpm);
     // Scrape time
     gettimeofday(&end, NULL);
     metrics->scrape_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
