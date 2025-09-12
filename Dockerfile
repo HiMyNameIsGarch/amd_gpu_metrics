@@ -14,9 +14,9 @@ WORKDIR /app
 COPY . .
 
 # build the server
-RUN gcc -O2 -Wall -o gpu_metrics_server server.c
+RUN gcc -O2 -Wall -o gpu_metrics_server gpu_metrics.c
 
-# expose a port if your server listens
+# expose a port for your server
 EXPOSE 7654
 
 # run the C server
